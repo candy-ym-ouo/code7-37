@@ -4,7 +4,7 @@ import { useRoute, useRouter } from "vue-router";
 import { categoryKeys, type CategoryKey } from "@map/shared/contracts";
 import LocationPicker from "../components/LocationPicker.vue";
 import PrivacyImageUploader from "../components/PrivacyImageUploader.vue";
-import { apiFetch } from "../lib/api";
+import { apiFetch, ApiError } from "../lib/api";
 
 type Category = { key: CategoryKey; name: string };
 type MediaResult = { id: string; status: string; url: string | null; thumbnailUrl: string | null };
@@ -65,6 +65,16 @@ const error = ref("");
 const success = ref("");
 const busy = ref(false);
 const loadedFeatureStatus = ref("");
+// 恢复点：本次会话中已创建成功的草稿 id，重试时从这里续传而不是重新创建
+const createdFeatureId = ref<string | null>(null);
+// 创建幂等键：每次进入新建表单生成一次，服务端据此去重
+const draftKey = ref(newDraftKey());
+
+function newDraftKey(): string {
+  return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `draft-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+}
 
 const form = reactive({
   categoryKey: categoryKeys[0] as CategoryKey,
@@ -176,6 +186,19 @@ async function loadExisting() {
   uploads.value = (feature.media ?? []).map((item: MediaResult) => ({ media: item }));
 }
 
+function markSubmitted() {
+  success.value = "已提交审核。审核通过前不会出现在公共地图。";
+  createdFeatureId.value = null;
+  draftKey.value = newDraftKey();
+  setTimeout(() => void router.push("/me/contributions"), 900);
+}
+
+async function isAlreadyPending(featureId: string): Promise<boolean> {
+  // 提交链路出现 409 时对齐服务端状态：上一次尝试可能已成功进入审核
+  const revisions = await apiFetch<Array<{ status: string }>>(`/features/${featureId}/revisions`).catch(() => null);
+  return revisions?.[0]?.status === "pending";
+}
+
 async function submit() {
   error.value = "";
   success.value = "";
@@ -212,21 +235,45 @@ async function submit() {
 
   busy.value = true;
   try {
-    let featureId = editId.value;
-    if (!featureId) {
-      const created = await apiFetch<{ id: string }>("/features", { method: "POST", body: payload });
-      featureId = created.id;
+    if (!editId.value) {
+      let featureId = createdFeatureId.value;
+      let syncDraft = true;
+      if (!featureId) {
+        const created = await apiFetch<{ id: string; status: string; deduplicated?: boolean }>("/features", {
+          method: "POST",
+          body: payload,
+          headers: { "Idempotency-Key": draftKey.value }
+        });
+        featureId = created.id;
+        createdFeatureId.value = created.id;
+        // 幂等重放返回的是旧内容，需要同步最新表单；全新草稿内容已是最新
+        syncDraft = created.deduplicated === true;
+        if (created.status === "pending") {
+          markSubmitted();
+          return;
+        }
+      }
+      if (syncDraft) await apiFetch(`/features/${featureId}/draft`, { method: "PATCH", body: payload });
       await apiFetch(`/features/${featureId}/submit`, { method: "POST" });
     } else if (["draft", "rejected", "changes_requested"].includes(loadedFeatureStatus.value)) {
-      await apiFetch(`/features/${featureId}/draft`, { method: "PATCH", body: payload });
-      await apiFetch(`/features/${featureId}/submit`, { method: "POST" });
+      await apiFetch(`/features/${editId.value}/draft`, { method: "PATCH", body: payload });
+      await apiFetch(`/features/${editId.value}/submit`, { method: "POST" });
     } else {
-      const revision = await apiFetch<{ id: string }>(`/features/${featureId}/revisions`, { method: "POST", body: payload });
-      await apiFetch(`/features/${featureId}/revisions/${revision.id}/submit`, { method: "POST" });
+      const revision = await apiFetch<{ id: string }>(`/features/${editId.value}/revisions`, { method: "POST", body: payload });
+      await apiFetch(`/features/${editId.value}/revisions/${revision.id}/submit`, { method: "POST" });
     }
-    success.value = "已提交审核。审核通过前不会出现在公共地图。";
-    setTimeout(() => void router.push("/me/contributions"), 900);
+    markSubmitted();
   } catch (cause) {
+    // 仅当 409 可能来自本次会话自己的提交时才对齐状态：新建流程要求草稿由本次会话创建；
+    // 修订流程的 pending 修订可能来自其他会话，直接展示服务端冲突信息更真实
+    const ownChain = editId.value
+      ? ["draft", "rejected", "changes_requested"].includes(loadedFeatureStatus.value)
+      : createdFeatureId.value !== null;
+    const featureId = editId.value ?? createdFeatureId.value;
+    if (cause instanceof ApiError && cause.status === 409 && ownChain && featureId && await isAlreadyPending(featureId)) {
+      markSubmitted();
+      return;
+    }
     error.value = cause instanceof Error ? cause.message : "提交失败";
   } finally {
     busy.value = false;

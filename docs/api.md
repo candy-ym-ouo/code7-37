@@ -7,6 +7,9 @@
 - 刷新令牌使用 HttpOnly Cookie；刷新请求需要 `X-CSRF-Token`。
 - 错误返回类似 RFC 9457 的结构，并包含 `code`、`detail` 和 `requestId`。
 - 地图查询必须传 `bbox=minLon,minLat,maxLon,maxLat`，单次跨度限制为 5 度。
+- `POST /features` 接受 `Idempotency-Key` 头（8–100 字符）。同一账号使用相同键重试时返回首次创建的草稿（HTTP 200 且 `deduplicated: true`），不会重复建草稿；草稿被删除后键自动释放。
+- 提交接口是幂等的：修订已处于 `pending` 时重复提交返回成功，不产生副作用。
+- 媒体同一时间只能归属一条未删除的内容；跨投稿复用会返回 409 `MEDIA_ALREADY_ATTACHED`。
 
 ## 公开接口
 
@@ -40,7 +43,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/features` | 创建草稿 |
+| `POST` | `/features` | 创建草稿；支持 `Idempotency-Key` 幂等重试 |
 | `PATCH` | `/features/:id/draft` | 更新草稿或被拒内容 |
 | `POST` | `/features/:id/submit` | 提交最新草稿 |
 | `POST` | `/features/:id/revisions` | 为已发布内容创建修订 |
