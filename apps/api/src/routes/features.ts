@@ -1,4 +1,4 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { PoolClient } from "pg";
 import { z } from "zod";
 import { createFeatureSchema } from "@map/shared/contracts";
@@ -8,6 +8,15 @@ import { optionalAuth, requireAuth, requireVerifiedContributor } from "../auth";
 import { deleteObject, publicMediaUrl } from "../storage";
 import { config } from "../config";
 import { recordAudit } from "../audit";
+import {
+  abortIdempotent,
+  acquireIdempotent,
+  completeIdempotent,
+  releaseIdempotent,
+  requireIdempotencyKey,
+  sendIdempotent,
+  type IdempotentHandle
+} from "../idempotency";
 
 type MediaRow = {
   id: string;
@@ -32,6 +41,7 @@ function payloadWithDate(input: z.infer<typeof createFeatureSchema>) {
   };
 }
 
+/** 媒体归属与隐私状态校验。提交和真正落库前都必须通过。 */
 async function assertMediaUsable(client: PoolClient, ownerId: string, mediaIds: string[]) {
   if (mediaIds.length === 0) return;
   const result = await client.query<{ id: string; privacy_status: string }>(
@@ -39,19 +49,64 @@ async function assertMediaUsable(client: PoolClient, ownerId: string, mediaIds: 
      WHERE id = ANY($1::uuid[]) AND owner_id = $2 AND deleted_at IS NULL`,
     [mediaIds, ownerId]
   );
-  if (result.rowCount !== mediaIds.length) throw new AppError(400, "VALIDATION_FAILED", "One or more media items do not belong to this account");
-  const invalid = result.rows.find((row) => !["ready", "manual_review"].includes(row.privacy_status));
-  if (invalid) throw new AppError(409, "MEDIA_NOT_READY", "All media must finish privacy processing before submission", { mediaStatus: invalid.privacy_status });
-}
-
-async function replaceRevisionMedia(client: PoolClient, revisionId: string, mediaIds: string[]) {
-  await client.query("DELETE FROM revision_media WHERE revision_id = $1", [revisionId]);
-  for (const [index, mediaId] of mediaIds.entries()) {
-    await client.query(
-      "INSERT INTO revision_media(revision_id, media_id, sort_order) VALUES ($1, $2, $3)",
-      [revisionId, mediaId, index]
+  if (result.rowCount !== mediaIds.length) {
+    const found = new Set(result.rows.map((row) => row.id));
+    throw new AppError(
+      400,
+      "MEDIA_NOT_FOUND",
+      "One or more media items do not belong to this account or no longer exist",
+      { mediaIds: mediaIds.filter((id) => !found.has(id)) }
     );
   }
+  const invalid = result.rows.find((row) => !["ready", "manual_review"].includes(row.privacy_status));
+  if (invalid) {
+    throw new AppError(409, "MEDIA_NOT_READY", "All media must finish privacy processing before submission", {
+      mediaId: invalid.id,
+      mediaStatus: invalid.privacy_status
+    });
+  }
+}
+
+/**
+ * 将媒体占用写入 feature_media_bindings。
+ * 唯一约束 + DO UPDATE 的 WHERE 条件保证：
+ * 已被其他投稿占用的媒体不会被静默抢占，而是返回 MEDIA_OCCUPIED 及占用方。
+ */
+async function claimMediaForFeature(client: PoolClient, featureId: string, mediaIds: string[]) {
+  const uniqueIds = [...new Set(mediaIds)];
+  if (uniqueIds.length === 0) return;
+  const claimed = await client.query<{ media_id: string }>(
+    `INSERT INTO feature_media_bindings(media_id, feature_id)
+     SELECT unnest_id, $2 FROM unnest($1::uuid[]) AS unnest_id
+     ON CONFLICT (media_id) DO UPDATE
+       SET feature_id = EXCLUDED.feature_id, bound_at = now()
+       WHERE feature_media_bindings.feature_id = EXCLUDED.feature_id
+     RETURNING media_id`,
+    [uniqueIds, featureId]
+  );
+  const claimedIds = new Set(claimed.rows.map((row) => row.media_id));
+  const blocked = uniqueIds.filter((id) => !claimedIds.has(id));
+  if (blocked.length > 0) {
+    const blockers = await client.query<{ media_id: string; feature_id: string }>(
+      "SELECT media_id, feature_id FROM feature_media_bindings WHERE media_id = ANY($1::uuid[]) AND feature_id <> $2",
+      [blocked, featureId]
+    );
+    const row = blockers.rows.find((item) => blocked.includes(item.media_id));
+    throw conflict(
+      "MEDIA_OCCUPIED",
+      "One or more media items are already attached to another contribution",
+      row ? { mediaId: row.media_id, occupiedByFeatureId: row.feature_id } : { mediaIds: blocked }
+    );
+  }
+}
+
+/** 草稿放弃部分媒体时释放占用；已发布内容的修订不得释放当前公开版本仍在使用的媒体。 */
+async function releaseUnclaimedDraftMedia(client: PoolClient, featureId: string, mediaIds: string[]) {
+  await client.query(
+    `DELETE FROM feature_media_bindings
+     WHERE feature_id = $1 AND NOT (media_id = ANY($2::uuid[]))`,
+    [featureId, [...new Set(mediaIds)]]
+  );
 }
 
 function bboxFromString(value: string): [number, number, number, number] {
@@ -67,6 +122,41 @@ function bboxFromString(value: string): [number, number, number, number] {
   const longitudeSpan = minLon > maxLon ? 360 - minLon + maxLon : maxLon - minLon;
   if (longitudeSpan > 5 || maxLat - minLat > 5) throw new AppError(400, "VALIDATION_FAILED", "bbox is too large");
   return [minLon, minLat, maxLon, maxLat];
+}
+
+/** 在幂等事务内执行业务；失败回滚占位列以便同键重试，成功则固化响应。 */
+async function withIdempotency<T>(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  run: (client: PoolClient) => Promise<{ status: number; body: T }>
+): Promise<void> {
+  const key = requireIdempotencyKey(request);
+  const outcome = await acquireIdempotent(request, key);
+  if ("replay" in outcome) {
+    sendIdempotent(reply, outcome);
+    return;
+  }
+  const handle: IdempotentHandle = outcome;
+  try {
+    const result = await run(handle.client);
+    await completeIdempotent(handle.client, request, key, result.status, result.body);
+    reply.code(result.status).send(result.body);
+  } catch (error) {
+    await abortIdempotent(handle.client);
+    throw error;
+  } finally {
+    releaseIdempotent(handle);
+  }
+}
+
+async function writeRevisionMedia(client: PoolClient, revisionId: string, mediaIds: string[]) {
+  await client.query("DELETE FROM revision_media WHERE revision_id = $1", [revisionId]);
+  for (const [index, mediaId] of mediaIds.entries()) {
+    await client.query(
+      "INSERT INTO revision_media(revision_id, media_id, sort_order) VALUES ($1, $2, $3)",
+      [revisionId, mediaId, index]
+    );
+  }
 }
 
 export async function featureRoutes(app: FastifyInstance) {
@@ -246,10 +336,11 @@ export async function featureRoutes(app: FastifyInstance) {
     };
   });
 
+  // 创建草稿：必须携带 Idempotency-Key，网络重试返回同一草稿，绝不重复落库。
   app.post("/features", { preHandler: requireVerifiedContributor }, async (request, reply) => {
     const input = createFeatureSchema.parse(request.body);
     const userId = request.user!.id;
-    const featureId = await transaction(async (client) => {
+    await withIdempotency(request, reply, async (client) => {
       const category = await client.query("SELECT 1 FROM categories WHERE key = $1 AND is_active = true", [input.categoryKey]);
       if (!category.rowCount) throw new AppError(400, "VALIDATION_FAILED", "Unknown category");
       await assertMediaUsable(client, userId, input.mediaIds);
@@ -267,7 +358,9 @@ export async function featureRoutes(app: FastifyInstance) {
          RETURNING id`,
         [featureId, userId, JSON.stringify(payloadWithDate(input))]
       );
-      await replaceRevisionMedia(client, revision.rows[0]!.id, input.mediaIds);
+      const revisionId = revision.rows[0]!.id;
+      await claimMediaForFeature(client, featureId, input.mediaIds);
+      await writeRevisionMedia(client, revisionId, input.mediaIds);
       await recordAudit(client, {
         actorId: userId,
         action: "feature.draft_created",
@@ -275,10 +368,8 @@ export async function featureRoutes(app: FastifyInstance) {
         resourceId: featureId,
         metadata: { categoryKey: input.categoryKey }
       });
-      return featureId;
+      return { status: 201, body: { id: featureId, status: "draft" } };
     });
-
-    return reply.code(201).send({ id: featureId, status: "draft" });
   });
 
   app.patch("/features/:id/draft", { preHandler: requireVerifiedContributor }, async (request) => {
@@ -295,7 +386,7 @@ export async function featureRoutes(app: FastifyInstance) {
       if (!row) throw notFound("Feature not found");
       if (row.owner_id !== userId) throw forbidden();
       if (!["draft", "rejected", "changes_requested"].includes(row.status)) {
-        throw conflict("Only draft or rejected content can be edited at this endpoint");
+        throw conflict("FEATURE_NOT_EDITABLE", "Only draft or rejected content can be edited at this endpoint");
       }
       const category = await client.query("SELECT 1 FROM categories WHERE key = $1 AND is_active = true", [input.categoryKey]);
       if (!category.rowCount) throw new AppError(400, "VALIDATION_FAILED", "Unknown or inactive category");
@@ -306,13 +397,15 @@ export async function featureRoutes(app: FastifyInstance) {
       );
       const revisionId = revision.rows[0]?.id;
       if (!revisionId) throw notFound("Revision not found");
+      await claimMediaForFeature(client, params.id, input.mediaIds);
+      await writeRevisionMedia(client, revisionId, input.mediaIds);
+      await releaseUnclaimedDraftMedia(client, params.id, input.mediaIds);
       await client.query(
         `UPDATE feature_revisions
          SET payload = $2::jsonb, status = 'draft', rejection_reason_code = NULL, moderation_notes = NULL, updated_at = now()
          WHERE id = $1`,
         [revisionId, JSON.stringify(payloadWithDate(input))]
       );
-      await replaceRevisionMedia(client, revisionId, input.mediaIds);
       await client.query(
         `UPDATE map_features
          SET category_key = $2, geom = ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
@@ -325,18 +418,20 @@ export async function featureRoutes(app: FastifyInstance) {
     return { status: "draft" };
   });
 
-  app.post("/features/:id/submit", { preHandler: requireVerifiedContributor }, async (request) => {
+  app.post("/features/:id/submit", { preHandler: requireVerifiedContributor }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const userId = request.user!.id;
-    await submitRevision(undefined, params.id, userId);
-    return { status: "pending" };
+    await withIdempotency(request, reply, async (client) => {
+      await submitRevision(client, undefined, params.id, userId);
+      return { status: 200, body: { status: "pending" } };
+    });
   });
 
   app.post("/features/:id/revisions", { preHandler: requireVerifiedContributor }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const input = createFeatureSchema.parse(request.body);
     const userId = request.user!.id;
-    const revisionId = await transaction(async (client) => {
+    await withIdempotency(request, reply, async (client) => {
       const feature = await client.query<{ owner_id: string; status: string }>(
         "SELECT owner_id, status FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
         [params.id]
@@ -344,14 +439,14 @@ export async function featureRoutes(app: FastifyInstance) {
       const row = feature.rows[0];
       if (!row) throw notFound("Feature not found");
       if (row.owner_id !== userId) throw forbidden();
-      if (row.status === "deleted") throw conflict("Deleted content cannot be revised");
+      if (row.status === "deleted") throw conflict("FEATURE_DELETED", "Deleted content cannot be revised");
       const category = await client.query("SELECT 1 FROM categories WHERE key = $1 AND is_active = true", [input.categoryKey]);
       if (!category.rowCount) throw new AppError(400, "VALIDATION_FAILED", "Unknown or inactive category");
       const pending = await client.query(
         "SELECT 1 FROM feature_revisions WHERE feature_id = $1 AND status = 'pending' LIMIT 1",
         [params.id]
       );
-      if (pending.rowCount) throw conflict("A revision is already waiting for moderation");
+      if (pending.rowCount) throw conflict("REVISION_ALREADY_PENDING", "A revision is already waiting for moderation");
       await assertMediaUsable(client, userId, input.mediaIds);
       const next = await client.query<{ next: number }>(
         "SELECT COALESCE(MAX(revision_no), 0) + 1 AS next FROM feature_revisions WHERE feature_id = $1",
@@ -362,16 +457,20 @@ export async function featureRoutes(app: FastifyInstance) {
          VALUES ($1, $2, $3, $4::jsonb, 'draft') RETURNING id`,
         [params.id, userId, next.rows[0]!.next, JSON.stringify(payloadWithDate(input))]
       );
-      await replaceRevisionMedia(client, inserted.rows[0]!.id, input.mediaIds);
-      return inserted.rows[0]!.id;
+      const revisionId = inserted.rows[0]!.id;
+      await claimMediaForFeature(client, params.id, input.mediaIds);
+      await writeRevisionMedia(client, revisionId, input.mediaIds);
+      return { status: 201, body: { id: revisionId, status: "draft" } };
     });
-    return reply.code(201).send({ id: revisionId, status: "draft" });
   });
 
-  app.post("/features/:id/revisions/:revisionId/submit", { preHandler: requireVerifiedContributor }, async (request) => {
+  app.post("/features/:id/revisions/:revisionId/submit", { preHandler: requireVerifiedContributor }, async (request, reply) => {
     const params = z.object({ id: z.string().uuid(), revisionId: z.string().uuid() }).parse(request.params);
-    await submitRevision(params.revisionId, params.id, request.user!.id);
-    return { status: "pending" };
+    const userId = request.user!.id;
+    await withIdempotency(request, reply, async (client) => {
+      await submitRevision(client, params.revisionId, params.id, userId);
+      return { status: 200, body: { status: "pending" } };
+    });
   });
 
   app.get("/features/:id/revisions", { preHandler: requireAuth }, async (request) => {
@@ -421,6 +520,7 @@ export async function featureRoutes(app: FastifyInstance) {
         "UPDATE map_features SET status = 'deleted', deleted_at = now(), updated_at = now() WHERE id = $1",
         [params.id]
       );
+      await client.query("DELETE FROM feature_media_bindings WHERE feature_id = $1", [params.id]);
       if (mediaResult.rowCount) {
         await client.query(
           `UPDATE media_assets SET privacy_status = 'deleted', deleted_at = now(), updated_at = now()
@@ -499,7 +599,7 @@ export async function featureRoutes(app: FastifyInstance) {
          RETURNING id`,
         [params.id, request.user!.id, input.result, input.note ?? null]
       );
-      if (!inserted.rowCount) throw conflict("This feature was already confirmed within the last 90 days");
+      if (!inserted.rowCount) throw conflict("ALREADY_CONFIRMED", "This feature was already confirmed within the last 90 days");
 
       if (input.result !== "still_accurate") {
         const risky = await client.query<{ count: number }>(
@@ -521,42 +621,46 @@ export async function featureRoutes(app: FastifyInstance) {
   });
 }
 
-async function submitRevision(revisionId: string | undefined, featureId: string, userId: string) {
-  await transaction(async (client) => {
-    const feature = await client.query<{ owner_id: string; status: string; current_revision_id: string | null }>(
-      "SELECT owner_id, status, current_revision_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
-      [featureId]
-    );
-    const featureRow = feature.rows[0];
-    if (!featureRow) throw notFound("Feature not found");
-    if (featureRow.owner_id !== userId) throw forbidden();
+async function submitRevision(client: PoolClient, revisionId: string | undefined, featureId: string, userId: string) {
+  const feature = await client.query<{ owner_id: string; status: string; current_revision_id: string | null }>(
+    "SELECT owner_id, status, current_revision_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+    [featureId]
+  );
+  const featureRow = feature.rows[0];
+  if (!featureRow) throw notFound("Feature not found");
+  if (featureRow.owner_id !== userId) throw forbidden();
 
-    const revision = revisionId
-      ? await client.query<{ id: string; status: string; payload: unknown }>(
-          "SELECT id, status, payload FROM feature_revisions WHERE id = $1 AND feature_id = $2 FOR UPDATE",
-          [revisionId, featureId]
-        )
-      : await client.query<{ id: string; status: string; payload: unknown }>(
-          "SELECT id, status, payload FROM feature_revisions WHERE feature_id = $1 ORDER BY revision_no DESC LIMIT 1 FOR UPDATE",
-          [featureId]
-        );
-    const revisionRow = revision.rows[0];
-    if (!revisionRow) throw notFound("Revision not found");
-    if (!["draft", "rejected", "changes_requested"].includes(revisionRow.status)) {
-      throw conflict("Revision is not eligible for submission");
-    }
+  const revision = revisionId
+    ? await client.query<{ id: string; status: string; payload: unknown }>(
+        "SELECT id, status, payload FROM feature_revisions WHERE id = $1 AND feature_id = $2 FOR UPDATE",
+        [revisionId, featureId]
+      )
+    : await client.query<{ id: string; status: string; payload: unknown }>(
+        "SELECT id, status, payload FROM feature_revisions WHERE feature_id = $1 ORDER BY revision_no DESC LIMIT 1 FOR UPDATE",
+        [featureId]
+      );
+  const revisionRow = revision.rows[0];
+  if (!revisionRow) throw notFound("Revision not found");
+  if (revisionRow.status === "pending") {
+    throw conflict("ALREADY_SUBMITTED", "Revision is already waiting for moderation", { revisionId: revisionRow.id });
+  }
+  if (!["draft", "rejected", "changes_requested"].includes(revisionRow.status)) {
+    throw conflict("REVISION_NOT_SUBMITTABLE", "Revision is not eligible for submission", {
+      revisionId: revisionRow.id,
+      revisionStatus: revisionRow.status
+    });
+  }
 
-    const payload = revisionRow.payload as { mediaIds?: string[] };
-    await assertMediaUsable(client, userId, payload.mediaIds ?? []);
-    await client.query(
-      `UPDATE feature_revisions
-       SET status = 'pending', submitted_at = now(), reviewed_at = NULL,
-           reviewer_id = NULL, rejection_reason_code = NULL, updated_at = now()
-       WHERE id = $1`,
-      [revisionRow.id]
-    );
-    if (!featureRow.current_revision_id) {
-      await client.query("UPDATE map_features SET status = 'pending', updated_at = now() WHERE id = $1", [featureId]);
-    }
-  });
+  const payload = revisionRow.payload as { mediaIds?: string[] };
+  await assertMediaUsable(client, userId, payload.mediaIds ?? []);
+  await client.query(
+    `UPDATE feature_revisions
+     SET status = 'pending', submitted_at = now(), reviewed_at = NULL,
+         reviewer_id = NULL, rejection_reason_code = NULL, updated_at = now()
+     WHERE id = $1`,
+    [revisionRow.id]
+  );
+  if (!featureRow.current_revision_id) {
+    await client.query("UPDATE map_features SET status = 'pending', updated_at = now() WHERE id = $1", [featureId]);
+  }
 }

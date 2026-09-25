@@ -28,6 +28,22 @@ describe("initial migration", () => {
     expect(followup).toContain("updated_at timestamptz");
   });
 
+  it("adds idempotency keys and media occupancy tables in migration 0003", () => {
+    const followup = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../migrations/0003_idempotency_media_occupancy.sql"),
+      "utf8"
+    );
+    expect(followup).toContain("CREATE TABLE idempotency_keys");
+    expect(followup).toContain("UNIQUE (user_id, idempotency_key)");
+    expect(followup).toContain("request_fingerprint");
+    expect(followup).toContain("response_status");
+    expect(followup).toContain("CREATE TABLE feature_media_bindings");
+    // 一个媒体只能被一条投稿占用：主键即 media_id。
+    expect(followup).toMatch(/media_id uuid PRIMARY KEY/);
+    // 历史 revision_media 引用需要回填占用。
+    expect(followup).toContain("INSERT INTO feature_media_bindings");
+  });
+
   it("uses PostGIS geography points and spatial indexes", () => {
     expect(migration).toContain("geography(Point, 4326)");
     expect(migration).toContain("USING gist (geom)");

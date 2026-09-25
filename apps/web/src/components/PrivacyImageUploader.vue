@@ -1,12 +1,22 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from "vue";
-import { apiFetch, uploadFile } from "../lib/api";
+import { ApiError, apiFetch, uploadFile } from "../lib/api";
 
 type PrivacyRegion = { x: number; y: number; width: number; height: number };
 type MediaResult = { id: string; status: string; url: string | null; thumbnailUrl: string | null };
 
 const props = defineProps<{ file: File }>();
 const emit = defineEmits<{ processed: [value: MediaResult]; remove: [] }>();
+
+/** 同一文件的整个上传生命周期复用一个键；重试 init 不会创建第二条 media_assets。 */
+const idempotencyKey = (() => {
+  const source = `${props.file.name}:${props.file.size}:${props.file.lastModified}:${props.file.type}`;
+  let hash = 5381;
+  for (let index = 0; index < source.length; index += 1) {
+    hash = ((hash << 5) + hash + source.charCodeAt(index)) >>> 0;
+  }
+  return `upload-${hash.toString(36)}-${props.file.lastModified.toString(36)}`;
+})();
 
 const previewUrl = URL.createObjectURL(props.file);
 const preview = ref<HTMLImageElement | null>(null);
@@ -83,19 +93,26 @@ async function processImage() {
         filename: props.file.name,
         mimeType: props.file.type,
         byteSize: props.file.size
-      }
+      },
+      idempotencyKey
     });
     status.value = "上传到私有隔离区…";
+    // PUT 到同一签名 key 天然幂等：重试直接覆盖同一对象，不会产生新的媒体行。
     await uploadFile(init.uploadUrl, props.file);
     status.value = "服务端处理隐私模糊…";
-    await apiFetch(`/media/uploads/${init.id}/complete`, {
-      method: "POST",
-      body: {
-        privacyRegions: regions.value,
-        containsPeopleOrPlates: containsPeopleOrPlates.value,
-        rightsConfirmed: true
-      }
-    });
+    try {
+      await apiFetch(`/media/uploads/${init.id}/complete`, {
+        method: "POST",
+        body: {
+          privacyRegions: regions.value,
+          containsPeopleOrPlates: containsPeopleOrPlates.value,
+          rightsConfirmed: true
+        }
+      });
+    } catch (cause) {
+      // 上一轮 complete 实际成功了：进入状态轮询即可，不视为失败。
+      if (!(cause instanceof ApiError && cause.code === "UPLOAD_ALREADY_COMPLETED")) throw cause;
+    }
 
     for (let attempt = 0; attempt < 60; attempt += 1) {
       const result = await apiFetch<MediaResult>(`/media/${init.id}`);

@@ -18,6 +18,6 @@ export function forbidden(message = "Permission denied") {
   return new AppError(403, "FORBIDDEN", message);
 }
 
-export function conflict(message = "Resource conflict") {
-  return new AppError(409, "CONFLICT", message);
+export function conflict(code: string, message: string, details?: unknown) {
+  return new AppError(409, code, message, details);
 }

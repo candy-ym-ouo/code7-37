@@ -34,7 +34,7 @@ export async function reportRoutes(app: FastifyInstance) {
         [request.user!.id, input.targetType, input.targetId, input.reasonCode, input.notes ?? null]
       ).catch((error: unknown) => {
         if (typeof error === "object" && error && "code" in error && error.code === "23505") {
-          throw conflict("You already have an open report for this item");
+          throw conflict("REPORT_ALREADY_OPEN", "You already have an open report for this item");
         }
         throw error;
       });

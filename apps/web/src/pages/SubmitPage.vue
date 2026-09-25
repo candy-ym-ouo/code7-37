@@ -4,7 +4,16 @@ import { useRoute, useRouter } from "vue-router";
 import { categoryKeys, type CategoryKey } from "@map/shared/contracts";
 import LocationPicker from "../components/LocationPicker.vue";
 import PrivacyImageUploader from "../components/PrivacyImageUploader.vue";
-import { apiFetch } from "../lib/api";
+import { ApiError, apiFetch } from "../lib/api";
+import {
+  clearSubmission,
+  discardRecoverableSubmission,
+  findRecoverableSubmission,
+  idempotencyKeyFor,
+  startSubmission,
+  updateSubmission,
+  type PendingSubmission
+} from "../lib/submission-recovery";
 
 type Category = { key: CategoryKey; name: string };
 type MediaResult = { id: string; status: string; url: string | null; thumbnailUrl: string | null };
@@ -65,6 +74,7 @@ const error = ref("");
 const success = ref("");
 const busy = ref(false);
 const loadedFeatureStatus = ref("");
+const recovery = ref<PendingSubmission | null>(null);
 
 const form = reactive({
   categoryKey: categoryKeys[0] as CategoryKey,
@@ -176,6 +186,68 @@ async function loadExisting() {
   uploads.value = (feature.media ?? []).map((item: MediaResult) => ({ media: item }));
 }
 
+type FeaturePayload = Record<string, unknown>;
+
+function describeError(cause: unknown, fallback: string): string {
+  if (cause instanceof ApiError) {
+    if (cause.code === "MEDIA_OCCUPIED") {
+      const details = (cause.details ?? {}) as { occupiedByFeatureId?: string };
+      return details.occupiedByFeatureId
+        ? `有图片已被另一条投稿占用。请先打开那条投稿移除该图片，再回到本页重试。`
+        : "有图片已被另一条投稿占用，请移除后再试。";
+    }
+    if (cause.code === "MEDIA_NOT_READY") return "有图片尚未完成服务端隐私处理，请稍候再提交。";
+    if (cause.code === "ALREADY_SUBMITTED" || cause.code === "REVISION_ALREADY_PENDING") {
+      return "该投稿已在审核队列中，无需重复提交。";
+    }
+    if (cause.code === "IDEMPOTENCY_KEY_REUSED") return "本次提交的请求编号与此前请求不一致，页面将使用新编号重试。";
+    return cause.message;
+  }
+  return cause instanceof Error ? cause.message : fallback;
+}
+
+function applyPayloadToForm(payload: FeaturePayload) {
+  if (typeof payload.categoryKey === "string" && (categoryKeys as readonly string[]).includes(payload.categoryKey)) {
+    form.categoryKey = payload.categoryKey as CategoryKey;
+    resetDetails();
+  }
+  if (typeof payload.title === "string") form.title = payload.title;
+  if (typeof payload.description === "string") form.description = payload.description;
+  if (typeof payload.longitude === "number") form.longitude = payload.longitude;
+  if (typeof payload.latitude === "number") form.latitude = payload.latitude;
+  if (typeof payload.locationAccuracyM === "number") form.locationAccuracyM = payload.locationAccuracyM;
+  if (typeof payload.observedAt === "string") form.observedAt = toLocalDateTimeInput(payload.observedAt);
+  if (typeof payload.condition === "string") form.condition = payload.condition;
+  form.stepFree = payload.stepFree === true ? "true" : payload.stepFree === false ? "false" : "";
+  form.wheelchairAccessible = payload.wheelchairAccessible === true ? "true" : payload.wheelchairAccessible === false ? "false" : "";
+  form.noiseLevel = typeof payload.noiseLevel === "number" ? String(payload.noiseLevel) : "";
+  form.tags = Array.isArray(payload.tags) ? (payload.tags as unknown[]).map(String).join(", ") : "";
+  resetDetails();
+  if (payload.details && typeof payload.details === "object") {
+    for (const [key, value] of Object.entries(payload.details as Record<string, unknown>)) {
+      details[key] = value === null || value === undefined ? "" : String(value);
+    }
+  }
+}
+
+async function hydrateRecoveryMedia(mediaIds: string[]): Promise<MediaResult[]> {
+  const settled = await Promise.all(
+    mediaIds.map((id) => apiFetch<MediaResult>(`/media/${id}`).catch(() => null))
+  );
+  return settled.filter((item): item is MediaResult => Boolean(item));
+}
+
+async function resumeRecoveredSubmission(submission: PendingSubmission) {
+  applyPayloadToForm(submission.payload);
+  uploads.value = (await hydrateRecoveryMedia(submission.mediaIds)).map((media) => ({ media }));
+  await runSubmission(submission);
+}
+
+function discardRecovery() {
+  if (recovery.value) discardRecoverableSubmission(recovery.value.submissionId);
+  recovery.value = null;
+}
+
 async function submit() {
   error.value = "";
   success.value = "";
@@ -193,7 +265,23 @@ async function submit() {
     return;
   }
 
-  const payload = {
+  const mode: PendingSubmission["mode"] = !editId.value
+    ? "create"
+    : ["draft", "rejected", "changes_requested"].includes(loadedFeatureStatus.value)
+      ? "edit-draft"
+      : "new-revision";
+  const submission = startSubmission({
+    mode,
+    featureId: editId.value,
+    payload: buildPayloadSnapshot(),
+    mediaIds: mediaItems.map((item) => item.id)
+  });
+  recovery.value = null;
+  await runSubmission(submission);
+}
+
+function buildPayloadSnapshot(): FeaturePayload {
+  return {
     categoryKey: form.categoryKey,
     title: form.title,
     description: form.description,
@@ -207,37 +295,118 @@ async function submit() {
     noiseLevel: parseOptionalNumber(form.noiseLevel),
     tags: form.tags.split(",").map((item) => item.trim()).filter(Boolean),
     details: buildDetails(),
-    mediaIds: mediaItems.map((item) => item.id)
+    mediaIds: uploads.value.map((item) => item.media?.id).filter((id): id is string => Boolean(id))
   };
+}
 
+async function runSubmission(submission: PendingSubmission) {
   busy.value = true;
   try {
-    let featureId = editId.value;
-    if (!featureId) {
-      const created = await apiFetch<{ id: string }>("/features", { method: "POST", body: payload });
-      featureId = created.id;
-      await apiFetch(`/features/${featureId}/submit`, { method: "POST" });
-    } else if (["draft", "rejected", "changes_requested"].includes(loadedFeatureStatus.value)) {
+    const payload = submission.payload as Parameters<typeof JSON.stringify>[0] & {
+      mediaIds: string[];
+    };
+
+    if (submission.mode === "create") {
+      let featureId = submission.draftFeatureId;
+      if (!featureId) {
+        updateSubmission(submission.submissionId, { stage: "creating-draft" });
+        const created = await apiFetch<{ id: string }>("/features", {
+          method: "POST",
+          body: payload,
+          idempotencyKey: idempotencyKeyFor("create", submission.submissionId)
+        });
+        featureId = created.id;
+        updateSubmission(submission.submissionId, { draftFeatureId: featureId });
+      }
+      updateSubmission(submission.submissionId, { stage: "submitting" });
+      await apiFetch(`/features/${featureId}/submit`, {
+        method: "POST",
+        idempotencyKey: idempotencyKeyFor("submit", submission.submissionId)
+      });
+    } else if (submission.mode === "edit-draft") {
+      const featureId = submission.featureId!;
+      updateSubmission(submission.submissionId, { stage: "updating-draft" });
       await apiFetch(`/features/${featureId}/draft`, { method: "PATCH", body: payload });
-      await apiFetch(`/features/${featureId}/submit`, { method: "POST" });
+      updateSubmission(submission.submissionId, { stage: "submitting", draftFeatureId: featureId });
+      await apiFetch(`/features/${featureId}/submit`, {
+        method: "POST",
+        idempotencyKey: idempotencyKeyFor("submit", submission.submissionId)
+      });
     } else {
-      const revision = await apiFetch<{ id: string }>(`/features/${featureId}/revisions`, { method: "POST", body: payload });
-      await apiFetch(`/features/${featureId}/revisions/${revision.id}/submit`, { method: "POST" });
+      const featureId = submission.featureId!;
+      let revisionId = submission.revisionId;
+      if (!revisionId) {
+        updateSubmission(submission.submissionId, { stage: "creating-revision" });
+        const revision = await apiFetch<{ id: string }>(`/features/${featureId}/revisions`, {
+          method: "POST",
+          body: payload,
+          idempotencyKey: idempotencyKeyFor("revision", submission.submissionId)
+        });
+        revisionId = revision.id;
+        updateSubmission(submission.submissionId, { revisionId });
+      }
+      updateSubmission(submission.submissionId, { stage: "submitting" });
+      await apiFetch(`/features/${featureId}/revisions/${revisionId}/submit`, {
+        method: "POST",
+        idempotencyKey: idempotencyKeyFor("revsubmit", submission.submissionId)
+      });
     }
+
+    clearSubmission(submission.submissionId);
+    recovery.value = null;
     success.value = "已提交审核。审核通过前不会出现在公共地图。";
     setTimeout(() => void router.push("/me/contributions"), 900);
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "提交失败";
+    const apiCause = cause instanceof ApiError ? cause : null;
+    // 服务端其实已经接收（如 ALREADY_SUBMITTED），恢复点作废，避免用户反复重试。
+    if (apiCause && ["ALREADY_SUBMITTED", "REVISION_ALREADY_PENDING"].includes(apiCause.code)) {
+      clearSubmission(submission.submissionId);
+      success.value = "该投稿已在审核队列中，无需重复提交。";
+      setTimeout(() => void router.push("/me/contributions"), 900);
+      return;
+    }
+    // 幂等键复用冲突只可能来自过期页面残留，换一个恢复点重跑。
+    if (apiCause?.code === "IDEMPOTENCY_KEY_REUSED") {
+      clearSubmission(submission.submissionId);
+      const restarted = startSubmission({
+        mode: submission.mode,
+        featureId: submission.featureId,
+        payload: submission.payload,
+        mediaIds: submission.mediaIds
+      });
+      error.value = "";
+      await runSubmission(restarted);
+      return;
+    }
+    recovery.value = submission;
+    error.value = describeError(cause, "提交失败，可点击“继续提交”重试，不会产生重复草稿。");
   } finally {
     busy.value = false;
   }
 }
 
+const stageLabels: Record<string, string> = {
+  "creating-draft": "创建草稿",
+  "updating-draft": "更新草稿",
+  "creating-revision": "创建修订",
+  submitting: "提交审核"
+};
+
 onMounted(async () => {
   categories.value = await apiFetch<Category[]>("/categories");
   resetDetails();
   await loadExisting().catch((cause) => { error.value = cause instanceof Error ? cause.message : "加载投稿失败"; });
+  const pending = findRecoverableSubmission(editId.value);
+  if (pending) recovery.value = pending;
 });
+
+async function continueRecovery() {
+  if (!recovery.value) return;
+  const pending = recovery.value;
+  error.value = "";
+  success.value = "";
+  await resumeRecoveredSubmission(pending);
+}
 </script>
 
 <template>
@@ -251,6 +420,20 @@ onMounted(async () => {
 
     <div v-if="error" class="error-box">{{ error }}</div>
     <div v-if="success" class="success-box">{{ success }}</div>
+
+    <div v-if="recovery && !busy" class="card" style="border-color: var(--accent, #b45309)">
+      <div class="card-body">
+        <strong>检测到上次未完成的提交</strong>
+        <p class="muted">
+          中断于“{{ stageLabels[recovery.stage] ?? recovery.stage }}”阶段（{{ new Date(recovery.updatedAt).toLocaleString() }}）。
+          继续提交会复用同一请求编号，服务端自动去重，不会产生重复草稿。
+        </p>
+        <div class="inline">
+          <button class="button" type="button" @click="continueRecovery">继续提交</button>
+          <button class="button ghost" type="button" @click="discardRecovery">放弃恢复点</button>
+        </div>
+      </div>
+    </div>
 
     <div class="stack">
       <section class="card"><div class="card-body">

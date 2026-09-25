@@ -9,11 +9,26 @@ export class ApiError extends Error {
   ) {
     super(message);
   }
+
+  /** 404/400/401/403 等确定结果不应自动重试；只有 409 冲突、408/429/5xx 和网络错误值得恢复。 */
+  get isRetryable(): boolean {
+    if (this.status >= 500 || this.status === 408 || this.status === 429 || this.status === 0) return true;
+    return [
+      "MEDIA_NOT_READY",
+      "MEDIA_OCCUPIED",
+      "ALREADY_SUBMITTED",
+      "REVISION_ALREADY_PENDING",
+      "IDEMPOTENCY_KEY_REUSED",
+      "QUEUE_UNAVAILABLE",
+      "REQUEST_FAILED"
+    ].includes(this.code);
+  }
 }
 
 type RequestOptions = Omit<RequestInit, "body"> & {
   body?: unknown;
   skipRefresh?: boolean;
+  idempotencyKey?: string;
 };
 
 async function parseResponse<T>(response: Response): Promise<T> {
@@ -59,11 +74,12 @@ export function refreshSession(): Promise<boolean> {
 }
 
 export async function apiFetch<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { body, skipRefresh, ...fetchOptions } = options;
+  const { body, skipRefresh, idempotencyKey, ...fetchOptions } = options;
   const headers = new Headers(fetchOptions.headers);
   const token = getAccessToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
   if (body !== undefined) headers.set("Content-Type", "application/json");
+  if (idempotencyKey) headers.set("Idempotency-Key", idempotencyKey);
 
   const requestInit: RequestInit = {
     ...fetchOptions,

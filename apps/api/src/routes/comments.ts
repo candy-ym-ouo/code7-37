@@ -46,9 +46,9 @@ export async function commentRoutes(app: FastifyInstance) {
         );
         const parentRow = parent.rows[0];
         if (!parentRow || parentRow.feature_id !== params.id || parentRow.status !== "published") {
-          throw conflict("Reply target is unavailable");
+          throw conflict("COMMENT_TARGET_UNAVAILABLE", "Reply target is unavailable");
         }
-        if (parentRow.parent_id) throw conflict("Only two comment levels are supported");
+        if (parentRow.parent_id) throw conflict("COMMENT_THREAD_TOO_DEEP", "Only two comment levels are supported");
       }
       const inserted = await client.query<{ id: string }>(
         `INSERT INTO comments(feature_id, author_id, parent_id, body, status)
@@ -100,9 +100,11 @@ export async function commentRoutes(app: FastifyInstance) {
       if (!row) throw notFound("Comment not found");
       if (row.author_id !== request.user!.id) throw forbidden();
       if (row.edited_at || Date.now() - row.created_at.getTime() > 15 * 60 * 1000) {
-        throw conflict("Comment edit window has expired");
+        throw conflict("COMMENT_EDIT_WINDOW_CLOSED", "Comment edit window has expired");
       }
-      if (!["pending", "published"].includes(row.status)) throw conflict("Comment cannot be edited");
+      if (!["pending", "published"].includes(row.status)) {
+        throw conflict("COMMENT_NOT_EDITABLE", "Comment cannot be edited", { status: row.status });
+      }
       await client.query(
         `UPDATE comments SET body = $2, status = 'pending', edited_at = now(), updated_at = now() WHERE id = $1`,
         [params.id, input.body]

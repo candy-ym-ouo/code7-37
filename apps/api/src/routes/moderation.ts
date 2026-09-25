@@ -81,7 +81,7 @@ export async function moderationRoutes(app: FastifyInstance) {
           [mediaIds]
         );
         if (media.rowCount !== mediaIds.length || media.rows.some((row) => row.privacy_status !== "ready")) {
-          throw conflict("All attached media must pass privacy review before content approval");
+          throw conflict("MEDIA_NOT_READY", "All attached media must pass privacy review before content approval");
         }
       }
 
@@ -242,7 +242,7 @@ export async function moderationRoutes(app: FastifyInstance) {
       );
       const feature = result.rows[0];
       if (!feature) throw notFound("Feature not found");
-      if (!feature.current_revision_id) throw conflict("Feature has no approved revision");
+      if (!feature.current_revision_id) throw conflict("FEATURE_NOT_PUBLISHED", "Feature has no approved revision");
       await client.query("UPDATE map_features SET status = 'published', updated_at = now() WHERE id = $1", [params.id]);
       await recordAudit(client, {
         actorId: request.user!.id,

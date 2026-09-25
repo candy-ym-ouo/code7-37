@@ -16,6 +16,14 @@ import {
 } from "../storage";
 import { enqueueMediaProcessing } from "../queue";
 import { recordAudit } from "../audit";
+import {
+  abortIdempotent,
+  acquireIdempotent,
+  completeIdempotent,
+  releaseIdempotent,
+  requireIdempotencyKey,
+  sendIdempotent
+} from "../idempotency";
 
 function extensionForMime(mime: string) {
   if (mime === "image/jpeg") return "jpg";
@@ -46,20 +54,37 @@ function mediaResponse(row: {
 }
 
 export async function mediaRoutes(app: FastifyInstance) {
+  // 创建隔离上传：携带 Idempotency-Key，重试不会产生孤儿 media_assets 行。
   app.post("/media/uploads", { preHandler: requireVerifiedContributor }, async (request, reply) => {
     const input = mediaUploadInitSchema.parse(request.body);
     if (input.byteSize > config.MEDIA_MAX_BYTES) {
       throw new AppError(400, "VALIDATION_FAILED", `File exceeds ${config.MEDIA_MAX_BYTES} bytes`);
     }
-    const id = randomUUID();
-    const key = `quarantine/${request.user!.id}/${id}.${extensionForMime(input.mimeType)}`;
-    await query(
-      `INSERT INTO media_assets(id, owner_id, original_filename, mime_type, byte_size, quarantine_object_key)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [id, request.user!.id, input.filename, input.mimeType, input.byteSize, key]
-    );
-    const uploadUrl = await createUploadUrl(key, input.mimeType);
-    return reply.code(201).send({ id, uploadUrl, expiresInSeconds: 600 });
+    const key = requireIdempotencyKey(request);
+    const outcome = await acquireIdempotent(request, key);
+    if ("replay" in outcome) {
+      sendIdempotent(reply, outcome);
+      return;
+    }
+    const handle = outcome;
+    try {
+      const id = randomUUID();
+      const objectKey = `quarantine/${request.user!.id}/${id}.${extensionForMime(input.mimeType)}`;
+      await handle.client.query(
+        `INSERT INTO media_assets(id, owner_id, original_filename, mime_type, byte_size, quarantine_object_key)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [id, request.user!.id, input.filename, input.mimeType, input.byteSize, objectKey]
+      );
+      const uploadUrl = await createUploadUrl(objectKey, input.mimeType);
+      const body = { id, uploadUrl, expiresInSeconds: 600 };
+      await completeIdempotent(handle.client, request, key, 201, body);
+      reply.code(201).send(body);
+    } catch (error) {
+      await abortIdempotent(handle.client);
+      throw error;
+    } finally {
+      releaseIdempotent(handle);
+    }
   });
 
   app.post("/media/uploads/:id/complete", { preHandler: requireVerifiedContributor }, async (request) => {
@@ -80,13 +105,24 @@ export async function mediaRoutes(app: FastifyInstance) {
     const media = result.rows[0];
     if (!media) throw notFound("Media not found");
     if (media.owner_id !== request.user!.id) throw forbidden();
-    if (media.privacy_status !== "quarantined") throw conflict("Media upload was already completed");
+    if (media.privacy_status !== "quarantined") {
+      throw conflict(
+        "UPLOAD_ALREADY_COMPLETED",
+        "Media upload was already completed",
+        { mediaId: params.id, mediaStatus: media.privacy_status }
+      );
+    }
 
     let metadata;
     try {
       metadata = await getQuarantineMetadata(media.quarantine_object_key);
     } catch {
-      throw new AppError(409, "CONFLICT", "Uploaded object was not found in quarantine storage");
+      throw new AppError(
+        409,
+        "UPLOADED_OBJECT_MISSING",
+        "Uploaded object was not found in quarantine storage",
+        { mediaId: params.id }
+      );
     }
     const actualBytes = Number(metadata.ContentLength ?? 0);
     const actualContentType = metadata.ContentType?.split(";")[0]?.trim();
@@ -160,10 +196,16 @@ export async function mediaRoutes(app: FastifyInstance) {
     const row = result.rows[0];
     if (!row) throw notFound("Media not found");
     if (row.owner_id !== request.user!.id && !["moderator", "admin"].includes(request.user!.role)) throw forbidden();
-    if (!["failed", "rejected"].includes(row.privacy_status)) throw conflict("Only failed media can be retried");
+    if (!["failed", "rejected"].includes(row.privacy_status)) {
+      throw conflict(
+        "MEDIA_NOT_RETRYABLE",
+        "Only failed or rejected media can be retried",
+        { mediaId: params.id, mediaStatus: row.privacy_status }
+      );
+    }
     await query("UPDATE media_assets SET privacy_status = 'processing', failure_code = NULL, updated_at = now() WHERE id = $1", [params.id]);
     try {
-      await enqueueMediaProcessing(params.id, `media-${params.id}-${Date.now()}`);
+      await enqueueMediaProcessing(params.id, `media-${params.id}`);
     } catch (error) {
       await query(
         "UPDATE media_assets SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now() WHERE id = $1",
@@ -182,7 +224,7 @@ export async function mediaRoutes(app: FastifyInstance) {
     );
     const media = result.rows[0];
     if (!media) throw notFound("Media not found");
-    if (!media.processed_object_key) throw conflict("Processed preview is not available");
+    if (!media.processed_object_key) throw conflict("PREVIEW_UNAVAILABLE", "Processed preview is not available");
     await query(
       `INSERT INTO audit_logs(actor_id, action, resource_type, resource_id, metadata)
        VALUES ($1, 'media.preview_viewed', 'media', $2, '{}'::jsonb)`,
@@ -213,7 +255,10 @@ export async function mediaRoutes(app: FastifyInstance) {
     const media = result.rows[0];
     if (!media) throw notFound("Media not found");
     if (media.privacy_status !== "manual_review" || !media.processed_object_key) {
-      throw conflict("Media is not waiting for manual privacy approval");
+      throw conflict("MEDIA_NOT_PENDING_REVIEW", "Media is not waiting for manual privacy approval", {
+        mediaId: params.id,
+        mediaStatus: media.privacy_status
+      });
     }
 
     const publicKey = `media/${params.id}.webp`;
@@ -280,11 +325,12 @@ export async function mediaRoutes(app: FastifyInstance) {
       [params.id]
     );
     if (publishedReference.rows[0]?.exists) {
-      throw conflict("Media attached to published content cannot be deleted separately");
+      throw conflict("MEDIA_PUBLISHED", "Media attached to published content cannot be deleted separately");
     }
 
     await transaction(async (client) => {
       await client.query("UPDATE media_assets SET privacy_status = 'deleted', deleted_at = now(), updated_at = now() WHERE id = $1", [params.id]);
+      await client.query("DELETE FROM feature_media_bindings WHERE media_id = $1", [params.id]);
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "media.deleted",

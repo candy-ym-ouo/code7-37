@@ -8,6 +8,36 @@
 - 错误返回类似 RFC 9457 的结构，并包含 `code`、`detail` 和 `requestId`。
 - 地图查询必须传 `bbox=minLon,minLat,maxLon,maxLat`，单次跨度限制为 5 度。
 
+## 幂等与冲突链路
+
+所有“创建/提交”类 POST 接口必须携带 `Idempotency-Key` 请求头（8-128 个可见 ASCII 字符，建议 UUID 或带前缀的随机串）：
+
+- `POST /features`、`POST /features/:id/submit`、`POST /features/:id/revisions`、`POST /features/:id/revisions/:revisionId/submit`、`POST /media/uploads`。
+- 服务端以 `(用户, Idempotency-Key)` 唯一约束记录请求方法、路径、请求体指纹（JSON 字段顺序无关）和最终响应。
+- 网络重试或超时重发同一 key：服务端串行化并发请求，业务只执行一次，重试方收到原状态码与原响应体，并带 `X-Idempotent-Replay: true`。这是“投稿失败重试不产生重复草稿”的服务端保证。
+- 业务执行失败（含 5xx）时不留成功记录，允许同键重试；同键不同方法、路径或请求体返回 `409 IDEMPOTENCY_KEY_REUSED`。
+- 幂等记录保留 24 小时，由 Worker 维护任务清理。
+- `PATCH /features/:id/draft` 本身是按目标状态更新的幂等操作，不要求幂等键。
+
+统一的 409 冲突错误码（均带 `details` 便于前端恢复）：
+
+| code | 含义 | 前端处理 |
+|---|---|---|
+| `IDEMPOTENCY_KEY_REUSED` | 幂等键被用于不同请求 | 换新键重试 |
+| `ALREADY_SUBMITTED` | 修订已在审核队列，重复提交 | 视为成功，跳转“我的投稿” |
+| `REVISION_ALREADY_PENDING` | 已有修订等待审核 | 提示后跳转列表 |
+| `REVISION_NOT_SUBMITTABLE` | 修订状态不可提交 | 加载最新状态 |
+| `FEATURE_NOT_EDITABLE` | 目标不在 draft/rejected/changes_requested | 改走修订流程 |
+| `MEDIA_NOT_READY` | 媒体仍在处理或被拒（409，含 `mediaId`/`mediaStatus`） | 等待后重试 |
+| `MEDIA_NOT_FOUND`（400） | 媒体不存在或不属于当前用户 | 移除本地引用 |
+| `MEDIA_OCCUPIED` | 媒体已被另一条投稿占用（含 `mediaId`、`occupiedByFeatureId`） | 先去占用方移除，再重试 |
+| `UPLOAD_ALREADY_COMPLETED` | 上传确认已处理 | 直接进入状态轮询 |
+| `QUEUE_UNAVAILABLE`（503） | 处理队列暂不可用 | 可安全重试 |
+
+媒体占用规则：一个媒体对象同一时刻只能被一条非删除投稿引用（`feature_media_bindings`）。在草稿间复用会收到 `MEDIA_OCCUPIED`；删除草稿或从草稿移除媒体会释放占用；已发布内容的媒体随修订历史保留。
+
+前端恢复点：投稿页把“创建草稿 → 提交审核”的当前阶段、幂等键和媒体 ID 持久化到本地（24 小时有效）。页面刷新或崩溃后回到投稿页会提示“继续上次提交”，复用同一幂等键续跑，既不重建草稿也不重复提交。
+
 ## 公开接口
 
 | 方法 | 路径 | 说明 |
@@ -40,11 +70,11 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/features` | 创建草稿 |
-| `PATCH` | `/features/:id/draft` | 更新草稿或被拒内容 |
-| `POST` | `/features/:id/submit` | 提交最新草稿 |
-| `POST` | `/features/:id/revisions` | 为已发布内容创建修订 |
-| `POST` | `/features/:id/revisions/:revisionId/submit` | 提交修订 |
+| `POST` | `/features` | 创建草稿（需 `Idempotency-Key`） |
+| `PATCH` | `/features/:id/draft` | 更新草稿或被拒内容（按目标状态幂等） |
+| `POST` | `/features/:id/submit` | 提交最新草稿（需 `Idempotency-Key`） |
+| `POST` | `/features/:id/revisions` | 为已发布内容创建修订（需 `Idempotency-Key`） |
+| `POST` | `/features/:id/revisions/:revisionId/submit` | 提交修订（需 `Idempotency-Key`） |
 | `GET` | `/features/:id/revisions` | 作者/审核员查看历史 |
 | `GET` | `/me/features` | 我的投稿 |
 | `DELETE` | `/features/:id` | 软删除 |
@@ -54,7 +84,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/media/uploads` | 创建隔离区签名上传 |
+| `POST` | `/media/uploads` | 创建隔离区签名上传（需 `Idempotency-Key`，重试不产生重复媒体） |
 | `POST` | `/media/uploads/:id/complete` | 提交隐私框并启动服务端处理 |
 | `GET` | `/media/:id` | 查询处理状态 |
 | `GET` | `/media/:id/preview` | 审核员获取短期私有预览 |
